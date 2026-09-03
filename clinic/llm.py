@@ -19,7 +19,7 @@ from clinic import slots
 from clinic.config import settings
 from clinic.intents import INTENTS, VERDICTS, Intent, Verdict
 from clinic.language import detect_language
-from clinic.responses import say
+from clinic.responses import RESPONSES, say
 from clinic.rules import keyword_intent, keyword_safety
 
 _SAFETY_PROMPT = (
@@ -45,6 +45,14 @@ _INTENT_PROMPT = (
 
 _PROMPTS = {"safety": _SAFETY_PROMPT, "intent": _INTENT_PROMPT}
 _VALID = {"safety": set(VERDICTS), "intent": set(INTENTS)}
+
+# Every localized slot-ask string, so the offline stub can tell when its previous
+# turn was a question (and this turn is therefore an answer).
+_ASK_PROMPTS = {
+    RESPONSES[key][lang]
+    for key in ("ask_date", "ask_department", "ask_severity")
+    for lang in RESPONSES[key]
+}
 
 
 @dataclass
@@ -134,18 +142,44 @@ class OfflineClient:
             return ChatResult({"role": "assistant", "content": text}, text=text)
 
         user_msgs = [m["content"] for m in messages if m["role"] == "user" and m.get("content")]
-        joined = " ".join(user_msgs)
         latest = user_msgs[-1] if user_msgs else ""
         lang = detect_language(latest)
-        intent = keyword_intent(latest) or keyword_intent(joined) or Intent.UNKNOWN
 
+        # Continuation: if our previous turn asked for a slot, this message is the
+        # answer to the action already in progress - not a fresh request.
+        if len(user_msgs) > 1 and self._awaiting_slot(messages):
+            window = self._active_window(user_msgs)
+            trigger = keyword_intent(window[0]) if window else None
+            if trigger == Intent.BOOK_APPOINTMENT:
+                return self._book(" ".join(window), lang)
+            if trigger == Intent.LOG_SYMPTOM:
+                return self._log(window, lang)
+
+        # Fresh request: classify the latest message on its own.
+        intent = keyword_intent(latest) or Intent.UNKNOWN
         if intent == Intent.BOOK_APPOINTMENT:
-            return self._book(joined, lang)
+            return self._book(latest, lang)
         if intent == Intent.LOG_SYMPTOM:
-            return self._log(user_msgs, joined, lang)
+            return self._log([latest], lang)
         if intent == Intent.LIST_APPOINTMENTS:
             return self._call("list_appointments", {})
         return self._text(say("fallback", lang))
+
+    def _awaiting_slot(self, messages: list[dict]) -> bool:
+        for m in reversed(messages):
+            if m["role"] == "assistant" and m.get("content"):
+                return m["content"] in _ASK_PROMPTS
+        return False
+
+    def _active_window(self, user_msgs: list[str]) -> list[str]:
+        # From the most recent booking/symptom request (before the latest answer)
+        # through to the latest message - the messages that belong to this action.
+        start = 0
+        for i in range(len(user_msgs) - 2, -1, -1):
+            if keyword_intent(user_msgs[i]) in (Intent.BOOK_APPOINTMENT, Intent.LOG_SYMPTOM):
+                start = i
+                break
+        return user_msgs[start:]
 
     def _book(self, text: str, lang: str) -> ChatResult:
         dept = slots.find_department(text)
@@ -156,9 +190,10 @@ class OfflineClient:
             return self._text(say("ask_department", lang))
         return self._text(say("ask_date", lang))
 
-    def _log(self, user_msgs: list[str], text: str, lang: str) -> ChatResult:
+    def _log(self, window: list[str], lang: str) -> ChatResult:
+        text = " ".join(window)
         severity = slots.find_severity(text)
-        symptom = user_msgs[0] if user_msgs else text
+        symptom = window[0] if window else text
         if severity is None:
             return self._text(say("ask_severity", lang))
         return self._call("log_symptom", {"symptom": symptom, "severity": severity})
